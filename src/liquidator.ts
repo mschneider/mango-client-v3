@@ -164,6 +164,14 @@ async function main() {
               continue;
             }
 
+            if (
+              mangoAccountKeyString ===
+              '9fAjixDvexyvGRTyc7gTVmeT3Zi5byerw1LrVv1mXXNe'
+            ) {
+              console.log(`Account ${mangoAccountKeyString} skipped`);
+              continue;
+            }
+
             liquidating[mangoAccountKeyString] = true;
             numLiquidating++;
             console.log(

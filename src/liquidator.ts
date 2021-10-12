@@ -1,9 +1,9 @@
 /**
-This will probably move to its own repo at some point but easier to keep it here for now
+ This will probably move to its own repo at some point but easier to keep it here for now
  */
 import * as os from 'os';
 import * as fs from 'fs';
-import { MangoClient } from './client';
+import { getUnixTs, MangoClient } from './client';
 import { Account, Commitment, Connection, PublicKey } from '@solana/web3.js';
 import { sleep } from './utils';
 import configFile from './ids.json';
@@ -11,7 +11,12 @@ import { Cluster, Config } from './config';
 import { I80F48, ONE_I80F48, ZERO_I80F48 } from './fixednum';
 import { Market, OpenOrders } from '@project-serum/serum';
 import BN from 'bn.js';
-import { MangoAccountLayout, MangoCache, QUOTE_INDEX } from './layout';
+import {
+  AdvancedOrdersLayout,
+  MangoAccountLayout,
+  MangoCache,
+  QUOTE_INDEX,
+} from './layout';
 import {
   AssetType,
   getMultipleAccounts,
@@ -19,6 +24,7 @@ import {
   MangoGroup,
   PerpMarket,
   RootBank,
+  zeroKey,
   ZERO_BN,
 } from '.';
 import { Orderbook } from '@project-serum/serum/lib/market';
@@ -38,6 +44,9 @@ const refreshWebsocketInterval = parseInt(
 const maxRebalancingRetries = parseInt(
   process.env.MAX_REBALANCING_RETRIES || '5',
 );
+const checkTriggers = process.env.CHECK_TRIGGERS
+  ? process.env.CHECK_TRIGGERS === 'true'
+  : true;
 const config = new Config(configFile);
 
 const cluster = (process.env.CLUSTER || 'mainnet') as Cluster;
@@ -56,11 +65,10 @@ const mangoGroupKey = groupIds.publicKey;
 
 const payer = new Account(
   JSON.parse(
-    process.env.PRIVATE_KEY ||
-      fs.readFileSync(
-        process.env.KEYPAIR || os.homedir() + '/.config/solana/id.json',
-        'utf-8',
-      ),
+    fs.readFileSync(
+      process.env.KEYPAIR || os.homedir() + '/.config/solana/id.json',
+      'utf-8',
+    ),
   ),
 );
 console.log(`Payer: ${payer.publicKey.toBase58()}`);
@@ -75,6 +83,51 @@ let mangoAccounts: MangoAccount[] = [];
 
 let mangoSubscriptionId = -1;
 let dexSubscriptionId = -1;
+
+/**
+ * Process trigger orders for one mango account
+ */
+async function processTriggerOrders(
+  mangoGroup: MangoGroup,
+  cache: MangoCache,
+  perpMarkets: PerpMarket[],
+  mangoAccount: MangoAccount,
+) {
+  if (!groupIds) {
+    throw new Error(`Group ${groupName} not found`);
+  }
+
+  for (let i = 0; i < mangoAccount.advancedOrders.length; i++) {
+    const order = mangoAccount.advancedOrders[i];
+    if (!(order.perpTrigger && order.perpTrigger.isActive)) {
+      continue;
+    }
+
+    const trigger = order.perpTrigger;
+    const currentPrice = cache.priceCache[trigger.marketIndex].price;
+    const configMarketIndex = groupIds.perpMarkets.findIndex(
+      (pm) => pm.marketIndex === trigger.marketIndex,
+    );
+    if (
+      (trigger.triggerCondition == 'above' &&
+        currentPrice.gt(trigger.triggerPrice)) ||
+      (trigger.triggerCondition == 'below' &&
+        currentPrice.lt(trigger.triggerPrice))
+    ) {
+      console.log(
+        `Executing order for account ${mangoAccount.publicKey.toBase58()}`,
+      );
+      await client.executePerpTriggerOrder(
+        mangoGroup,
+        mangoAccount,
+        cache,
+        perpMarkets[configMarketIndex],
+        payer,
+        i,
+      );
+    }
+  }
+}
 
 async function main() {
   if (!groupIds) {
@@ -96,7 +149,7 @@ async function main() {
       throw new Error('Account not owned by Keypair');
     }
   } else {
-    let accounts = await client.getMangoAccountsForOwner(
+    const accounts = await client.getMangoAccountsForOwner(
       mangoGroup,
       payer.publicKey,
       true,
@@ -144,76 +197,110 @@ async function main() {
   // eslint-disable-next-line
   while (true) {
     try {
-      cache = await mangoGroup.loadCache(connection);
-      await liqorMangoAccount.reload(connection);
+      if (checkTriggers) {
+        // load all the advancedOrders accounts
+        const mangoAccountsWithAOs = mangoAccounts.filter(
+          (ma) => ma.advancedOrdersKey && !ma.advancedOrdersKey.equals(zeroKey),
+        );
+        const allAOs = mangoAccountsWithAOs.map((ma) => ma.advancedOrdersKey);
 
-      for (let mangoAccount of mangoAccounts) {
-        const health = mangoAccount.getHealthRatio(mangoGroup, cache, 'Maint');
+        let advancedOrders;
+        [cache, liqorMangoAccount, advancedOrders] = await Promise.all([
+          mangoGroup.loadCache(connection),
+          liqorMangoAccount.reload(connection),
+          getMultipleAccounts(connection, allAOs),
+        ]);
+
+        mangoAccountsWithAOs.forEach((ma, i) => {
+          const decoded = AdvancedOrdersLayout.decode(
+            advancedOrders[i].accountInfo.data,
+          );
+          ma.advancedOrders = decoded.orders;
+        });
+      } else {
+        [cache, liqorMangoAccount] = await Promise.all([
+          mangoGroup.loadCache(connection),
+          liqorMangoAccount.reload(connection),
+        ]);
+      }
+
+      for (const mangoAccount of mangoAccounts) {
         const mangoAccountKeyString = mangoAccount.publicKey.toBase58();
-        if (mangoAccount.isLiquidatable(mangoGroup, cache)) {
-          if (!liquidating[mangoAccountKeyString] && numLiquidating < 1) {
-            await mangoAccount.reload(connection, mangoGroup.dexProgramId);
-            const maintHealth = mangoAccount.getHealth(
+
+        // Handle trigger orders for this mango account
+        if (checkTriggers && mangoAccount.advancedOrders) {
+          try {
+            await processTriggerOrders(
               mangoGroup,
               cache,
-              'Maint',
-            );
-
-            if (!(maintHealth.isNeg() || mangoAccount.beingLiquidated)) {
-              console.log(
-                `Account ${mangoAccountKeyString} no longer liquidatable`,
-              );
-              continue;
-            }
-
-            if (
-              mangoAccountKeyString ===
-              '9fAjixDvexyvGRTyc7gTVmeT3Zi5byerw1LrVv1mXXNe'
-            ) {
-              console.log(`Account ${mangoAccountKeyString} skipped`);
-              continue;
-            }
-
-            liquidating[mangoAccountKeyString] = true;
-            numLiquidating++;
-            console.log(
-              `Sick account ${mangoAccountKeyString} health: ${health.toString()}`,
-            );
-            notify(
-              `Sick account ${mangoAccountKeyString} health: ${health.toString()}`,
-            );
-            console.log(
-              mangoAccount.toPrettyString(groupIds, mangoGroup, cache),
-            );
-            liquidateAccount(
-              mangoGroup,
-              cache,
-              spotMarkets,
-              rootBanks,
               perpMarkets,
               mangoAccount,
-              liqorMangoAccount,
-            )
-              .then(() => {
-                console.log('Liquidated account', mangoAccountKeyString);
-                notify(`Liquidated account ${mangoAccountKeyString}`);
-              })
-              .catch((err) => {
-                console.error(
-                  'Failed to liquidate account',
-                  mangoAccountKeyString,
-                  err,
-                );
-                notify(
-                  `Failed to liquidate account ${mangoAccountKeyString}: ${err}`,
-                );
-              })
-              .finally(() => {
-                liquidating[mangoAccountKeyString] = false;
-                numLiquidating--;
-              });
+            );
+          } catch (err) {
+            console.error(
+              `Failed to execute trigger order for ${mangoAccountKeyString}`,
+              err,
+            );
           }
         }
+
+        // If not liquidatable continue to next mango account
+        if (
+          !(
+            mangoAccount.isLiquidatable(mangoGroup, cache) &&
+            !liquidating[mangoAccountKeyString] &&
+            numLiquidating < 1
+          )
+        ) {
+          continue;
+        }
+
+        // Reload mango account to make sure still liquidatable
+        await mangoAccount.reload(connection, mangoGroup.dexProgramId);
+        if (!mangoAccount.isLiquidatable(mangoGroup, cache)) {
+          console.log(
+            `Account ${mangoAccountKeyString} no longer liquidatable`,
+          );
+          continue;
+        }
+
+        liquidating[mangoAccountKeyString] = true;
+        numLiquidating++;
+        const health = mangoAccount.getHealthRatio(mangoGroup, cache, 'Maint');
+        console.log(
+          `Sick account ${mangoAccountKeyString} health ratio: ${health.toString()}`,
+        );
+        notify(
+          `Sick account ${mangoAccountKeyString} health ratio: ${health.toString()}`,
+        );
+        console.log(mangoAccount.toPrettyString(groupIds, mangoGroup, cache));
+        liquidateAccount(
+          mangoGroup,
+          cache,
+          spotMarkets,
+          rootBanks,
+          perpMarkets,
+          mangoAccount,
+          liqorMangoAccount,
+        )
+          .then(() => {
+            console.log('Liquidated account', mangoAccountKeyString);
+            notify(`Liquidated account ${mangoAccountKeyString}`);
+          })
+          .catch((err) => {
+            console.error(
+              'Failed to liquidate account',
+              mangoAccountKeyString,
+              err,
+            );
+            notify(
+              `Failed to liquidate account ${mangoAccountKeyString}: ${err}`,
+            );
+          })
+          .finally(() => {
+            liquidating[mangoAccountKeyString] = false;
+            numLiquidating--;
+          });
       }
       await sleep(interval);
     } catch (err) {
@@ -528,25 +615,27 @@ async function liquidateSpot(
       console.log(maxNet.toString());
       if (maxNet.lt(ONE_I80F48) || maxNetIndex == -1) {
         const highestHealthMarket = perpMarkets
-        .map((perpMarket, i) => {
-          const marketIndex = mangoGroup.getPerpMarketIndex(perpMarket.publicKey);
-          const perpMarketInfo = mangoGroup.perpMarkets[marketIndex];
-          const perpAccount = liqee.perpAccounts[marketIndex];
-          const perpMarketCache = cache.perpMarketCache[marketIndex];
-          const price = mangoGroup.getPriceNative(marketIndex, cache);
-          const perpHealth = perpAccount.getHealth(
-            perpMarketInfo,
-            price,
-            perpMarketInfo.maintAssetWeight,
-            perpMarketInfo.maintLiabWeight,
-            perpMarketCache.longFunding,
-            perpMarketCache.shortFunding,
-          );
-          return { perpHealth: perpHealth, marketIndex: marketIndex, i };
-        })
-        .sort((a, b) => {
-          return b.perpHealth.sub(a.perpHealth).toNumber();
-        })[0];
+          .map((perpMarket, i) => {
+            const marketIndex = mangoGroup.getPerpMarketIndex(
+              perpMarket.publicKey,
+            );
+            const perpMarketInfo = mangoGroup.perpMarkets[marketIndex];
+            const perpAccount = liqee.perpAccounts[marketIndex];
+            const perpMarketCache = cache.perpMarketCache[marketIndex];
+            const price = mangoGroup.getPriceNative(marketIndex, cache);
+            const perpHealth = perpAccount.getHealth(
+              perpMarketInfo,
+              price,
+              perpMarketInfo.maintAssetWeight,
+              perpMarketInfo.maintLiabWeight,
+              perpMarketCache.longFunding,
+              perpMarketCache.shortFunding,
+            );
+            return { perpHealth: perpHealth, marketIndex: marketIndex, i };
+          })
+          .sort((a, b) => {
+            return b.perpHealth.sub(a.perpHealth).toNumber();
+          })[0];
 
         console.log('liquidateTokenAndPerp ' + highestHealthMarket.marketIndex);
         await client.liquidateTokenAndPerp(
@@ -800,7 +889,7 @@ async function balanceTokens(
           o.openOrdersAddress.equals(mangoAccount.spotOpenOrders[i]),
         );
 
-        for (let order of orders) {
+        for (const order of orders) {
           cancelOrdersPromises.push(
             client.cancelSpotOrder(
               mangoGroup,
@@ -919,6 +1008,7 @@ async function balanceTokens(
           Math.abs(postDiffs[nv[0]].toNumber()) > markets[nv[0]].minOrderSize,
       );
       if (!isUnbalanced) {
+        // eslint-disable-next-line
         break;
       }
     }
@@ -964,8 +1054,8 @@ async function closePositions(
 
           if (basePositionSize != 0) {
             const side = perpAccount.basePosition.gt(ZERO_BN) ? 'sell' : 'buy';
-            const liquidationFee =
-              mangoGroup.perpMarkets[index].liquidationFee.toNumber();
+            // const liquidationFee =
+            //   mangoGroup.perpMarkets[index].liquidationFee.toNumber();
 
             const orderPrice =
               side == 'sell'
@@ -999,7 +1089,7 @@ async function closePositions(
           if (!perpAccount.quotePosition.eq(ZERO_I80F48)) {
             const quoteRootBank = mangoGroup.rootBankAccounts[QUOTE_INDEX];
             if (quoteRootBank) {
-              let newQuotePosition = new I80F48(
+              const newQuotePosition = new I80F48(
                 perpAccount.basePosition.neg().mul(perpMarket.baseLotSize),
               ).mul(price);
               const pnl = perpAccount.quotePosition.min(newQuotePosition);
@@ -1024,7 +1114,7 @@ async function closePositions(
       await sleep(2000);
       await mangoAccount.reload(connection, mangoGroup.dexProgramId);
       // Check if we need to balance again
-      const isUnbalanced = perpMarkets.some((pm, i) => {
+      const isUnbalanced = perpMarkets.some((pm) => {
         const index = mangoGroup.getPerpMarketIndex(pm.publicKey);
         const perpAccount = mangoAccount.perpAccounts[index];
         const basePositionSize = Math.abs(
@@ -1035,6 +1125,7 @@ async function closePositions(
       });
 
       if (!isUnbalanced) {
+        // eslint-disable-next-line
         break;
       }
     }

@@ -12,6 +12,7 @@ import {
   u8,
   UInt,
   union,
+  Union,
 } from 'buffer-layout';
 import { PublicKey } from '@solana/web3.js';
 import { I80F48 } from './fixednum';
@@ -191,9 +192,37 @@ export function advancedOrderTypeLayout(property, span) {
 }
 
 /**
- * Need to implement layouts for each of the structs found in state.rs
+ * Makes custom modifications to the instruction layouts because valid instructions can be many sizes
  */
-export const MangoInstructionLayout = union(u32('instruction'));
+class MangoInstructionsUnion extends Union {
+  constructor(discr?, defaultLayout?, property?) {
+    super(discr, defaultLayout, property);
+  }
+  decode(b: Buffer, offset) {
+    if (undefined === offset) {
+      offset = 0;
+    }
+    const discr = this['discriminator'].decode(b, offset);
+
+    // Adjust for old instructions that don't have optional bytes added to end
+    if (
+      (discr === 11 && b.length === 144) ||
+      (discr === 12 && b.length === 30)
+    ) {
+      b = Buffer.concat([b, Buffer.from([0])]);
+    } else if (discr === 37 && b.length === 141) {
+      b = Buffer.concat([b, Buffer.from([0, 0])]);
+    }
+    return super.decode(b, offset);
+  }
+  addVariant(variant, layout, property) {
+    return super.addVariant(variant, layout, property);
+  }
+}
+
+export const MangoInstructionLayout = new MangoInstructionsUnion(
+  u32('instruction'),
+);
 MangoInstructionLayout.addVariant(
   0,
   struct([
@@ -441,12 +470,34 @@ MangoInstructionLayout.addVariant(
   'ExecutePerpTriggerOrder',
 );
 
+MangoInstructionLayout.addVariant(
+  46,
+  struct([
+    I80F48Layout('maintLeverage'),
+    I80F48Layout('initLeverage'),
+    I80F48Layout('liquidationFee'),
+    I80F48Layout('makerFee'),
+    I80F48Layout('takerFee'),
+    i64('baseLotSize'),
+    i64('quoteLotSize'),
+    i64('numEvents'),
+    I80F48Layout('rate'),
+    I80F48Layout('maxDepthBps'),
+    u64('targetPeriodLength'),
+    u64('mngoPerPeriod'),
+    u8('exp'),
+    u8('version'),
+  ]),
+  'CreatePerpMarket',
+);
+
 const instructionMaxSpan = Math.max(
   // @ts-ignore
   ...Object.values(MangoInstructionLayout.registry).map((r) => r.span),
 );
 export function encodeMangoInstruction(data) {
   const b = Buffer.alloc(instructionMaxSpan);
+  // @ts-ignore
   const span = MangoInstructionLayout.encode(data, b);
   return b.slice(0, span);
 }

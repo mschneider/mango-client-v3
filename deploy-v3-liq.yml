@@ -45,12 +45,6 @@ spec:
               value: mainnet
             - name: GROUP
               value: mainnet.1
-            - name: INTERVAL
-              value: '1000'
-            - name: INTERVAL_ACCOUNTS
-              value: '30000'
-            - name: INTERVAL_WEBSOCKET
-              value: '61000'
             - name: PRIVATE_KEY
               valueFrom:
                 secretKeyRef:

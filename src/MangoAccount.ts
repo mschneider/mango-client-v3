@@ -146,7 +146,7 @@ export default class MangoAccount {
   ): I80F48 {
     return nativeI80F48ToUi(
       this.getNativeDeposit(rootBank, tokenIndex).floor(),
-      mangoGroup.tokens[tokenIndex].decimals,
+      mangoGroup.getTokenDecimals(tokenIndex),
     );
   }
   getUiBorrow(
@@ -156,7 +156,7 @@ export default class MangoAccount {
   ): I80F48 {
     return nativeI80F48ToUi(
       this.getNativeBorrow(rootBank, tokenIndex).ceil(),
-      mangoGroup.tokens[tokenIndex].decimals,
+      mangoGroup.getTokenDecimals(tokenIndex),
     );
   }
 
@@ -833,7 +833,9 @@ export default class MangoAccount {
         groupConfig,
         mangoGroup.perpMarkets[i].perpMarket,
       ) as PerpMarketConfig;
-
+      if (market === undefined) {
+        continue;
+      }
       const perpAccount = this.perpAccounts[i];
       const perpMarketInfo = mangoGroup.perpMarkets[i];
       lines.push(

@@ -1,6 +1,7 @@
 import {
   Cluster,
   Config,
+  getPerpMarketByBaseSymbol,
   getPerpMarketByIndex,
   PerpMarketConfig,
 } from './config';
@@ -23,17 +24,20 @@ import {
 } from './index';
 import { BN } from 'bn.js';
 import MangoAccount from './MangoAccount';
+import MangoGroup from './MangoGroup';
+import PerpMarket from './PerpMarket';
 
 async function mm() {
   // load mango group and clients
   const config = new Config(configFile);
-  const cluster = (process.env.CLUSTER || 'devnet') as Cluster;
   const groupName = process.env.GROUP || 'devnet.2';
-  const groupIds = config.getGroup(cluster, groupName);
+  const mangoAccountName = process.env.MANGO_ACCOUNT_NAME;
+
+  const groupIds = config.getGroupWithName(groupName);
   if (!groupIds) {
     throw new Error(`Group ${groupName} not found`);
   }
-
+  const cluster = groupIds.cluster as Cluster;
   const mangoProgramId = groupIds.mangoProgramId;
   const mangoGroupKey = groupIds.publicKey;
 
@@ -56,39 +60,71 @@ async function mm() {
   const mangoGroup = await client.getMangoGroup(mangoGroupKey);
 
   // TODO make it fetch all mango accounts for owner and select highest value one
-  const mangoAccountPk = new PublicKey(
-    'FG99s25HS1UKcP1jMx72Gezg6KZCC7DuKXhNW51XC1qi',
+  const ownerAccounts = await client.getMangoAccountsForOwner(
+    mangoGroup,
+    payer.publicKey,
+    true,
   );
 
-  // while true loop with try catch inside
-  // periodically check staleness
-  // periodically receive fresh OB and mango account state
-  // periodically
+  let mangoAccountPk;
+  if (mangoAccountName) {
+    for (const ownerAccount of ownerAccounts) {
+      if (mangoAccountName === ownerAccount.name) {
+        mangoAccountPk = ownerAccount.publicKey;
+        break;
+      }
+    }
+    if (!mangoAccountPk) {
+      throw new Error('MANGO_ACCOUNT_NAME not found');
+    }
+  } else {
+    const mangoAccountPkStr = process.env.MANGO_ACCOUNT_PUBKEY;
+    if (!mangoAccountPkStr) {
+      throw new Error(
+        'Please add env variable MANGO_ACCOUNT_PUBKEY or MANGO_ACCOUNT_NAME',
+      );
+    } else {
+      mangoAccountPk = new PublicKey(mangoAccountPkStr);
+    }
+  }
 
   // TODO make it be able to quote all markets
-  const marketIndex = 1;
-  const perpMarketConfig = getPerpMarketByIndex(
+  const marketName = process.env.MARKET;
+  if (!marketName) {
+    throw new Error('Please add env variable MARKET');
+  }
+
+  const perpMarketConfig = getPerpMarketByBaseSymbol(
     groupIds,
-    marketIndex,
+    marketName.toUpperCase(),
   ) as PerpMarketConfig;
+  const marketIndex = perpMarketConfig.marketIndex;
   const perpMarket = await client.getPerpMarket(
     perpMarketConfig.publicKey,
     perpMarketConfig.baseDecimals,
     perpMarketConfig.quoteDecimals,
   );
 
+  const sizePerc = parseFloat(process.env.SIZE_PERC || '0.1');
+  const interval = parseInt(process.env.INTERVAL || '10000');
+  const charge = parseFloat(process.env.CHARGE || '0.0010');
+  const leanCoeff = parseFloat(process.env.LEAN_COEFF || '0.0005');
+
+  const control = { isRunning: true, interval: interval };
   process.on('SIGINT', function () {
     console.log('Caught keyboard interrupt. Canceling orders');
-    process.exit();
+    onExit(
+      client,
+      payer,
+      mangoProgramId,
+      mangoGroup,
+      perpMarket,
+      mangoAccountPk,
+      control,
+    );
   });
 
-  const interval = 10000;
-  const sizePerc = 0.1;
-  const charge = 0.0005;
-  const leanCoeff = 0.0005;
-
-  // eslint-disable-next-line no-constant-condition
-  while (true) {
+  while (control.isRunning) {
     try {
       // get fresh data
       // get orderbooks, get perp markets, caches
@@ -187,6 +223,41 @@ async function mm() {
       await sleep(interval);
     }
   }
+}
+
+async function onExit(
+  client: MangoClient,
+  payer: Account,
+  mangoProgramId: PublicKey,
+  mangoGroup: MangoGroup,
+  perpMarket: PerpMarket,
+  mangoAccountPk: PublicKey,
+  control: { isRunning: boolean; interval: number },
+) {
+  await sleep(control.interval);
+  control.isRunning = false;
+  const mangoAccount = await client.getMangoAccount(
+    mangoAccountPk,
+    mangoGroup.dexProgramId,
+  );
+
+  const cancelAllInstr = makeCancelAllPerpOrdersInstruction(
+    mangoProgramId,
+    mangoGroup.publicKey,
+    mangoAccount.publicKey,
+    payer.publicKey,
+    perpMarket.publicKey,
+    perpMarket.bids,
+    perpMarket.asks,
+    new BN(20),
+  );
+  const tx = new Transaction();
+  tx.add(cancelAllInstr);
+
+  const txid = await client.sendTransaction(tx, payer, []);
+  console.log(`quoting successful: ${txid.toString()}`);
+
+  process.exit();
 }
 
 mm();

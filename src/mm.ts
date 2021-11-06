@@ -59,7 +59,6 @@ async function mm() {
 
   const mangoGroup = await client.getMangoGroup(mangoGroupKey);
 
-  // TODO make it fetch all mango accounts for owner and select highest value one
   const ownerAccounts = await client.getMangoAccountsForOwner(
     mangoGroup,
     payer.publicKey,
@@ -109,7 +108,8 @@ async function mm() {
   const interval = parseInt(process.env.INTERVAL || '10000');
   const charge = parseFloat(process.env.CHARGE || '0.0010');
   const leanCoeff = parseFloat(process.env.LEAN_COEFF || '0.0005');
-
+  const bias = parseFloat(process.env.BIAS || '0.0');
+  const requoteThresh = parseFloat(process.env.REQUOTE_THRESH || '0.0');
   const control = { isRunning: true, interval: interval };
   process.on('SIGINT', function () {
     console.log('Caught keyboard interrupt. Canceling orders');
@@ -128,7 +128,7 @@ async function mm() {
     try {
       // get fresh data
       // get orderbooks, get perp markets, caches
-      // TODO load pyth oracle for most accurate prices
+      // TODO load pyth oracle itself for most accurate prices
       const [mangoCache, mangoAccount]: [MangoCache, MangoAccount] =
         await Promise.all([
           // perpMarket.loadBids(connection),
@@ -151,71 +151,108 @@ async function mm() {
       // TODO volatility adjustment
       const size = (equity * sizePerc) / fairValue;
       const lean = (-leanCoeff * basePos) / size;
-      const bidPrice = fairValue * (1 - charge + lean);
-      const askPrice = fairValue * (1 + charge + lean);
+      const bidPrice = fairValue * (1 - charge + lean + bias);
+      const askPrice = fairValue * (1 + charge + lean + bias);
 
-      // TODO only requote if new prices significantly different from current
       const [nativeBidPrice, nativeBidSize] =
         perpMarket.uiToNativePriceQuantity(bidPrice, size);
       const [nativeAskPrice, nativeAskSize] =
         perpMarket.uiToNativePriceQuantity(askPrice, size);
 
-      // cancel all, requote
-      const cancelAllInstr = makeCancelAllPerpOrdersInstruction(
-        mangoProgramId,
-        mangoGroup.publicKey,
-        mangoAccount.publicKey,
-        payer.publicKey,
-        perpMarket.publicKey,
-        perpMarket.bids,
-        perpMarket.asks,
-        new BN(20),
-      );
+      // TODO use order book to requote even if
+      const openOrders = mangoAccount
+        .getPerpOpenOrders()
+        .filter((o) => o.marketIndex === marketIndex);
+      let moveOrders = openOrders.length === 0 || openOrders.length > 2;
+      for (const o of openOrders) {
+        console.log(
+          `${o.side} ${o.price.toString()} -> ${
+            o.side === 'buy'
+              ? nativeBidPrice.toString()
+              : nativeAskPrice.toString()
+          }`,
+        );
 
-      const placeBidInstr = makePlacePerpOrderInstruction(
-        mangoProgramId,
-        mangoGroup.publicKey,
-        mangoAccount.publicKey,
-        payer.publicKey,
-        mangoCache.publicKey,
-        perpMarket.publicKey,
-        perpMarket.bids,
-        perpMarket.asks,
-        perpMarket.eventQueue,
-        mangoAccount.getOpenOrdersKeysInBasket(),
-        nativeBidPrice,
-        nativeBidSize,
-        new BN(Date.now()),
-        'buy',
-        'postOnlySlide',
-      );
+        if (o.side === 'buy') {
+          if (
+            Math.abs(o.price.toNumber() / nativeBidPrice.toNumber() - 1) >
+            requoteThresh
+          ) {
+            moveOrders = true;
+          }
+        } else {
+          if (
+            Math.abs(o.price.toNumber() / nativeAskPrice.toNumber() - 1) >
+            requoteThresh
+          ) {
+            moveOrders = true;
+          }
+        }
+      }
 
-      const placeAskInstruction = makePlacePerpOrderInstruction(
-        mangoProgramId,
-        mangoGroup.publicKey,
-        mangoAccount.publicKey,
-        payer.publicKey,
-        mangoCache.publicKey,
-        perpMarket.publicKey,
-        perpMarket.bids,
-        perpMarket.asks,
-        perpMarket.eventQueue,
-        mangoAccount.getOpenOrdersKeysInBasket(),
-        nativeAskPrice,
-        nativeAskSize,
-        new BN(Date.now()),
-        'sell',
-        'postOnlySlide',
-      );
-      const tx = new Transaction();
-      tx.add(cancelAllInstr);
-      tx.add(placeBidInstr);
-      tx.add(placeAskInstruction);
+      if (moveOrders) {
+        // cancel all, requote
+        const cancelAllInstr = makeCancelAllPerpOrdersInstruction(
+          mangoProgramId,
+          mangoGroup.publicKey,
+          mangoAccount.publicKey,
+          payer.publicKey,
+          perpMarket.publicKey,
+          perpMarket.bids,
+          perpMarket.asks,
+          new BN(20),
+        );
 
-      const txid = await client.sendTransaction(tx, payer, []);
-      console.log(`quoting successful: ${txid.toString()}`);
+        const placeBidInstr = makePlacePerpOrderInstruction(
+          mangoProgramId,
+          mangoGroup.publicKey,
+          mangoAccount.publicKey,
+          payer.publicKey,
+          mangoCache.publicKey,
+          perpMarket.publicKey,
+          perpMarket.bids,
+          perpMarket.asks,
+          perpMarket.eventQueue,
+          mangoAccount.getOpenOrdersKeysInBasket(),
+          nativeBidPrice,
+          nativeBidSize,
+          new BN(Date.now()),
+          'buy',
+          'postOnlySlide',
+        );
+
+        const placeAskInstr = makePlacePerpOrderInstruction(
+          mangoProgramId,
+          mangoGroup.publicKey,
+          mangoAccount.publicKey,
+          payer.publicKey,
+          mangoCache.publicKey,
+          perpMarket.publicKey,
+          perpMarket.bids,
+          perpMarket.asks,
+          perpMarket.eventQueue,
+          mangoAccount.getOpenOrdersKeysInBasket(),
+          nativeAskPrice,
+          nativeAskSize,
+          new BN(Date.now()),
+          'sell',
+          'postOnlySlide',
+        );
+        const tx = new Transaction();
+        tx.add(cancelAllInstr);
+        tx.add(placeBidInstr);
+        tx.add(placeAskInstr);
+
+        const txid = await client.sendTransaction(tx, payer, []);
+        console.log(
+          `quoting ${marketName}-PERP successful: ${txid.toString()}`,
+        );
+      } else {
+        console.log(
+          `Not re-quoting ${marketName}-PERP. No need to move orders`,
+        );
+      }
     } catch (e) {
-      // TODO on keyboard interrupt cancel all and exit
       // sleep for some time and retry
       console.log(e);
     } finally {
@@ -234,8 +271,8 @@ async function onExit(
   mangoAccountPk: PublicKey,
   control: { isRunning: boolean; interval: number },
 ) {
-  await sleep(control.interval);
   control.isRunning = false;
+  await sleep(control.interval);
   const mangoAccount = await client.getMangoAccount(
     mangoAccountPk,
     mangoGroup.dexProgramId,
